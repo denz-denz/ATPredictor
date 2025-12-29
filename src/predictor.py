@@ -1,5 +1,6 @@
 import glob
 import os
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Optional, Union, Dict, List
 
@@ -10,6 +11,8 @@ from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.linear_model import LogisticRegression
+
+N_FORM = 20 # last 20 matches for recent form
 
 
 DateLike = Union[str, pd.Timestamp]
@@ -44,6 +47,7 @@ class TennisPredictor:
 
         self.matches = self._load_matches()
         self.rank_index = self._build_rank_index(self.matches)
+        self.form_index = self._build_form_index(self.matches)
 
         self.model = self._train_baseline_model(self.matches)
 
@@ -118,41 +122,72 @@ class TennisPredictor:
         return float(hist.iloc[idx]["rank"])
 
     # ---------- Training ----------
+    
 
     def _make_training_examples(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Convert (winner, loser) rows into randomized (A, B) training rows.
+        Convert (winner, loser) rows into randomized (A, B) training rows
+        and add time-safe recent form features computed from matches strictly before each match.
         """
         rng = np.random.default_rng(self.seed)
+
+        overall_hist = defaultdict(lambda: deque(maxlen=N_FORM))  # player -> deque of 1/0
+        surface_hist = defaultdict(lambda: defaultdict(lambda: deque(maxlen=N_FORM)))  # player -> surface -> deque
+
         rows = []
 
         for _, r in df.iterrows():
+            date = r["tourney_date"]
             surf = r["surface"]
             level = r.get("tourney_level", "U")
-            date = r["tourney_date"]
 
+            w = r["winner_name"]
+            l = r["loser_name"]
             w_rank = float(r["winner_rank"])
             l_rank = float(r["loser_rank"])
 
+            def winrates(player: str):
+                o = overall_hist[player]
+                s = surface_hist[player][surf]
+
+                # if no history, use 0.5 so we don't bias early matches
+                wr_o = (sum(o) / len(o)) if len(o) else 0.5
+                wr_s = (sum(s) / len(s)) if len(s) else 0.5
+                return wr_o, wr_s
+
+            # compute form BEFORE updating with this match (prevents leakage)
+            w_wr_o, w_wr_s = winrates(w)
+            l_wr_o, l_wr_s = winrates(l)
+
+            # Randomize A/B so A isn't always the winner
             swap = rng.random() < 0.5
             if not swap:
                 A_rank, B_rank = w_rank, l_rank
+                A_wr_o, B_wr_o = w_wr_o, l_wr_o
+                A_wr_s, B_wr_s = w_wr_s, l_wr_s
                 y = 1
             else:
                 A_rank, B_rank = l_rank, w_rank
+                A_wr_o, B_wr_o = l_wr_o, w_wr_o
+                A_wr_s, B_wr_s = l_wr_s, w_wr_s
                 y = 0
 
-            rows.append(
-                {
-                    "date": date,
-                    "surface": surf,
-                    "tourney_level": level,
-                    "rank_diff": A_rank - B_rank,
-                    "y": y,
-                }
-            )
+            rows.append({
+                "date": date,
+                "surface": surf,
+                "tourney_level": level,
+                "rank_diff": A_rank - B_rank,
+                "form_diff": A_wr_o - B_wr_o,
+                "surface_form_diff": A_wr_s - B_wr_s,
+                "y": y,
+            })
 
+            # update histories AFTER creating features
+            overall_hist[w].append(1); overall_hist[l].append(0)
+            surface_hist[w][surf].append(1); surface_hist[l][surf].append(0)
+    
         return pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
+
 
     def _train_baseline_model(self, df: pd.DataFrame) -> Pipeline:
         data = self._make_training_examples(df)
@@ -162,7 +197,7 @@ class TennisPredictor:
 
         preprocess = ColumnTransformer(
             transformers=[
-                ("num", "passthrough", ["rank_diff"]),
+                ("num", "passthrough", ["rank_diff", "form_diff", "surface_form_diff"]),
                 ("cat", OneHotEncoder(handle_unknown="ignore"), ["surface", "tourney_level"]),
             ]
         )
@@ -174,10 +209,71 @@ class TennisPredictor:
             ]
         )
 
-        X_train = train[["rank_diff", "surface", "tourney_level"]]
+        X_train = train[["rank_diff", "form_diff", "surface_form_diff", "surface", "tourney_level"]]
         y_train = train["y"]
         clf.fit(X_train, y_train)
         return clf
+
+    def _build_form_index(self, df: pd.DataFrame) -> dict:
+        """
+        Build per-player chronological history of outcomes for fast inference-time form computation.
+        Stores one table per player: columns [date, win, surface]
+        """
+        records = {}
+
+        for _, r in df.iterrows():
+            d = r["tourney_date"]
+            surf = r["surface"]
+            w = r["winner_name"]
+            l = r["loser_name"]
+
+            records.setdefault(w, []).append((d, 1, surf))
+            records.setdefault(l, []).append((d, 0, surf))
+
+        out = {}
+        for player, lst in records.items():
+            tmp = pd.DataFrame(lst, columns=["date", "win", "surface"]).sort_values("date").reset_index(drop=True)
+            out[player] = tmp
+        return out
+
+
+    def _recent_form(self, player: str, date: pd.Timestamp, n: int = N_FORM) -> float:
+        """
+        Win rate over last n matches strictly BEFORE date. Returns 0.5 if insufficient history.
+        """
+        hist = self.form_index.get(player)
+        if hist is None or hist.empty:
+            return 0.5
+
+        dates = hist["date"].values
+        idx = np.searchsorted(dates, np.datetime64(date), side="left")
+        if idx <= 0:
+            return 0.5
+
+        window = hist.iloc[max(0, idx - n):idx]
+        return float(window["win"].mean()) if len(window) else 0.5
+
+
+    def _recent_surface_form(self, player: str, date: pd.Timestamp, surface: str, n: int = N_FORM) -> float:
+        """
+        Win rate over last n matches on `surface` strictly BEFORE date. Returns 0.5 if insufficient history.
+        """
+        hist = self.form_index.get(player)
+        if hist is None or hist.empty:
+            return 0.5
+
+        # filter to matches on this surface first, then take last n before date
+        surf_hist = hist[hist["surface"] == surface]
+        if surf_hist.empty:
+            return 0.5
+
+        dates = surf_hist["date"].values
+        idx = np.searchsorted(dates, np.datetime64(date), side="left")
+        if idx <= 0:
+            return 0.5
+
+        window = surf_hist.iloc[max(0, idx - n):idx]
+        return float(window["win"].mean()) if len(window) else 0.5
 
     def predict_match(
         self,
@@ -209,9 +305,19 @@ class TennisPredictor:
 
         rank_diff = rankA - rankB
 
+        formA = self._recent_form(playerA, d)
+        formB = self._recent_form(playerB, d)
+        surfFormA = self._recent_surface_form(playerA, d, surface)
+        surfFormB = self._recent_surface_form(playerB, d, surface)
+
+        form_diff = formA - formB
+        surface_form_diff = surfFormA - surfFormB
+
         X = pd.DataFrame(
             [{
                 "rank_diff": rank_diff,
+                "form_diff": form_diff,
+                "surface_form_diff": surface_form_diff,
                 "surface": surface,
                 "tourney_level": tourney_level,
             }]
