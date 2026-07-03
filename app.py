@@ -1,6 +1,7 @@
 import os
 import sys
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
@@ -79,6 +80,14 @@ if st.button("Predict", type="primary"):
             st.caption("How many sets the match takes, independent of who wins.")
             sets_df = pd.DataFrame(
                 {"sets": [str(s) for s in result.sets_probs.keys()], "probability": list(result.sets_probs.values())}
-            ).set_index("sets")
-            st.bar_chart(sets_df)
+            )
+            chart = (
+                alt.Chart(sets_df)
+                .mark_bar()
+                .encode(
+                    x=alt.X("sets:N", title="Sets", axis=alt.Axis(labelAngle=0)),
+                    y=alt.Y("probability:Q", title="Probability"),
+                )
+            )
+            st.altair_chart(chart, use_container_width=True)
             st.caption(" · ".join(f"{s} sets: {p:.0%}" for s, p in result.sets_probs.items()))
