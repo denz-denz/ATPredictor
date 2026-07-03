@@ -11,5 +11,6 @@ __pycache__/
 # OS files
 .DS_Store
 
-# Data
+# Raw match data (TML-Database terms don't clearly permit redistribution;
+# keep local-only. Trained model artifacts in models/ are committed instead.)
 data/

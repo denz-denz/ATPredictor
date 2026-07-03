@@ -6,8 +6,12 @@ import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
-from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import accuracy_score, log_loss, roc_auc_score
+
+from predictor import _parse_num_sets
+
+SEED = 42
 
 
 def load_matches(data_dir: str) -> pd.DataFrame:
@@ -32,6 +36,11 @@ def load_matches(data_dir: str) -> pd.DataFrame:
     # some files might not have tourney_level; create placeholder
     if "tourney_level" not in df.columns:
         df["tourney_level"] = "U"
+    if "score" not in df.columns:
+        df["score"] = None
+    if "best_of" not in df.columns:
+        df["best_of"] = 3
+    df["best_of"] = df["best_of"].fillna(3)
 
     return df
 
@@ -49,6 +58,7 @@ def make_examples(df: pd.DataFrame, seed: int = 42) -> pd.DataFrame:
 
         w_rank = r["winner_rank"]
         l_rank = r["loser_rank"]
+        best_of = int(r.get("best_of", 3))
 
         # Randomize A/B to avoid "player A always wins" bias
         swap = rng.random() < 0.5
@@ -66,6 +76,8 @@ def make_examples(df: pd.DataFrame, seed: int = 42) -> pd.DataFrame:
                 "tourney_level": level,
                 "rank_diff": float(A_rank) - float(B_rank),
                 "y": y,
+                "best_of": best_of,
+                "num_sets": _parse_num_sets(r.get("score"), best_of),
             }
         )
 
@@ -95,6 +107,22 @@ def evaluate(clf, split: pd.DataFrame, name: str):
     }
 
 
+def evaluate_sets(clf, split: pd.DataFrame, name: str):
+    split = split[split["num_sets"].notna()].copy()
+    split["abs_rank_diff"] = split["rank_diff"].abs()
+
+    X = split[["abs_rank_diff", "best_of", "surface", "tourney_level"]]
+    y = split["num_sets"].astype(int).values
+    p = clf.predict_proba(X)
+    pred = clf.classes_[p.argmax(axis=1)]
+    return {
+        "split": name,
+        "n": len(split),
+        "accuracy": accuracy_score(y, pred),
+        "log_loss": log_loss(y, p, labels=clf.classes_),
+    }
+
+
 def main():
     df = load_matches("data")
     data = make_examples(df)
@@ -104,14 +132,19 @@ def main():
     preprocess = ColumnTransformer(
         transformers=[
             ("num", "passthrough", ["rank_diff"]),
-            ("cat", OneHotEncoder(handle_unknown="ignore"), ["surface", "tourney_level"]),
+            ("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=False), ["surface", "tourney_level"]),
         ]
     )
 
     clf = Pipeline(
         steps=[
             ("prep", preprocess),
-            ("model", LogisticRegression(max_iter=300)),
+            ("model", HistGradientBoostingClassifier(
+                max_depth=6,
+                learning_rate=0.05,
+                max_iter=300,
+                random_state=SEED
+            )),
         ]
     )
 
@@ -125,7 +158,47 @@ def main():
         ]
     )
 
+    print("Win-probability model")
     print(results.to_string(index=False))
+
+    sets_train = train.copy()
+    sets_train["abs_rank_diff"] = sets_train["rank_diff"].abs()
+    sets_train = sets_train[sets_train["num_sets"].notna()]
+
+    sets_preprocess = ColumnTransformer(
+        transformers=[
+            ("num", "passthrough", ["abs_rank_diff", "best_of"]),
+            ("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=False), ["surface", "tourney_level"]),
+        ]
+    )
+
+    sets_clf = Pipeline(
+        steps=[
+            ("prep", sets_preprocess),
+            ("model", HistGradientBoostingClassifier(
+                max_depth=6,
+                learning_rate=0.05,
+                max_iter=300,
+                random_state=SEED
+            )),
+        ]
+    )
+
+    sets_clf.fit(
+        sets_train[["abs_rank_diff", "best_of", "surface", "tourney_level"]],
+        sets_train["num_sets"].astype(int),
+    )
+
+    sets_results = pd.DataFrame(
+        [
+            evaluate_sets(sets_clf, train, "train"),
+            evaluate_sets(sets_clf, valid, "valid"),
+            evaluate_sets(sets_clf, test, "test"),
+        ]
+    )
+
+    print("\nSet-count model")
+    print(sets_results.to_string(index=False))
 
 
 if __name__ == "__main__":
