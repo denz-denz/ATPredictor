@@ -15,7 +15,23 @@ from sklearn.ensemble import HistGradientBoostingClassifier
 
 N_FORM = 20 # last 20 matches for recent form
 
+K_ELO = 32
+STARTING_ELO = 1500.0
+
 RETIRED_MARKERS = ("RET", "W/O", "WO", "DEF", "ABN", "ABD")
+
+
+def _safe_rate(numer, denom) -> Optional[float]:
+    if pd.isna(numer) or pd.isna(denom) or denom <= 0:
+        return None
+    return float(numer) / float(denom)
+
+
+def _global_mean_rate(df: pd.DataFrame, numer_col: str, denom_col: str) -> float:
+    numer = pd.concat([df[f"w_{numer_col}"], df[f"l_{numer_col}"]])
+    denom = pd.concat([df[f"w_{denom_col}"], df[f"l_{denom_col}"]])
+    valid = denom > 0
+    return float((numer[valid] / denom[valid]).mean())
 
 
 DateLike = Union[str, pd.Timestamp]
@@ -80,6 +96,10 @@ class TennisPredictor:
         self.tournament_index = self._build_tournament_index(self.matches)
         self._activity = self.matches[["tourney_date", "winner_name", "loser_name"]].copy()
 
+        self.elo_index, self.surface_elo_index = self._build_elo_index(self.matches)
+        (self.ace_index, self.fsw_index, self.bps_index,
+         self._fallback_ace, self._fallback_fsw, self._fallback_bps) = self._build_serve_stat_index(self.matches)
+
         train_examples = self._make_training_examples(self.matches)
         self.model = self._train_win_model(train_examples)
         self.sets_model = self._train_sets_model(train_examples)
@@ -101,6 +121,14 @@ class TennisPredictor:
         obj.form_index = state["form_index"]
         obj.tournament_index = state["tournament_index"]
         obj._activity = state["activity"]
+        obj.elo_index = state["elo_index"]
+        obj.surface_elo_index = state["surface_elo_index"]
+        obj.ace_index = state["ace_index"]
+        obj.fsw_index = state["fsw_index"]
+        obj.bps_index = state["bps_index"]
+        obj._fallback_ace = state["fallback_ace"]
+        obj._fallback_fsw = state["fallback_fsw"]
+        obj._fallback_bps = state["fallback_bps"]
         obj.model = state["model"]
         obj.sets_model = state["sets_model"]
         return obj
@@ -114,6 +142,14 @@ class TennisPredictor:
                 "form_index": self.form_index,
                 "tournament_index": self.tournament_index,
                 "activity": self._activity,
+                "elo_index": self.elo_index,
+                "surface_elo_index": self.surface_elo_index,
+                "ace_index": self.ace_index,
+                "fsw_index": self.fsw_index,
+                "bps_index": self.bps_index,
+                "fallback_ace": self._fallback_ace,
+                "fallback_fsw": self._fallback_fsw,
+                "fallback_bps": self._fallback_bps,
                 "model": self.model,
                 "sets_model": self.sets_model,
             },
@@ -150,6 +186,12 @@ class TennisPredictor:
         if "best_of" not in df.columns:
             df["best_of"] = 3
         df["best_of"] = df["best_of"].fillna(3)
+
+        for prefix in ("w_", "l_"):
+            for stat in ("ace", "svpt", "1stIn", "1stWon", "bpSaved", "bpFaced"):
+                col = f"{prefix}{stat}"
+                if col not in df.columns:
+                    df[col] = np.nan
 
         return df
 
@@ -198,6 +240,126 @@ class TennisPredictor:
             return None
         return float(hist.iloc[idx]["rank"])
 
+    # ---------- Elo indexing (for inference) ----------
+
+    def _build_elo_index(self, df: pd.DataFrame):
+        """
+        Sequentially replays match history to compute overall + per-surface
+        Elo ratings, snapshotting each player's rating *after* every match so
+        we can later look up "rating strictly before date" at inference time.
+        Standard Elo update: everyone starts at STARTING_ELO, K=K_ELO.
+        """
+        elo = defaultdict(lambda: STARTING_ELO)
+        surface_elo = defaultdict(lambda: defaultdict(lambda: STARTING_ELO))
+
+        overall_records: Dict[str, List[tuple]] = {}
+        surface_records: Dict[str, List[tuple]] = {}
+
+        for _, r in df.iterrows():
+            d = r["tourney_date"]
+            surf = r["surface"]
+            w, l = r["winner_name"], r["loser_name"]
+
+            w_elo, l_elo = elo[w], elo[l]
+            w_selo, l_selo = surface_elo[surf][w], surface_elo[surf][l]
+
+            exp_w = 1.0 / (1.0 + 10 ** ((l_elo - w_elo) / 400.0))
+            elo[w] = w_elo + K_ELO * (1 - exp_w)
+            elo[l] = l_elo - K_ELO * (1 - exp_w)
+
+            exp_w_s = 1.0 / (1.0 + 10 ** ((l_selo - w_selo) / 400.0))
+            surface_elo[surf][w] = w_selo + K_ELO * (1 - exp_w_s)
+            surface_elo[surf][l] = l_selo - K_ELO * (1 - exp_w_s)
+
+            overall_records.setdefault(w, []).append((d, elo[w]))
+            overall_records.setdefault(l, []).append((d, elo[l]))
+            surface_records.setdefault(w, []).append((d, surf, surface_elo[surf][w]))
+            surface_records.setdefault(l, []).append((d, surf, surface_elo[surf][l]))
+
+        overall_index = {
+            player: pd.DataFrame(lst, columns=["date", "elo"]).sort_values("date").reset_index(drop=True)
+            for player, lst in overall_records.items()
+        }
+        surface_index = {
+            player: pd.DataFrame(lst, columns=["date", "surface", "elo"]).sort_values("date").reset_index(drop=True)
+            for player, lst in surface_records.items()
+        }
+        return overall_index, surface_index
+
+    def _last_known_elo(self, player: str, date: pd.Timestamp) -> float:
+        hist = self.elo_index.get(player)
+        if hist is None or hist.empty:
+            return STARTING_ELO
+        dates = hist["date"].values
+        idx = np.searchsorted(dates, np.datetime64(date), side="left") - 1
+        if idx < 0:
+            return STARTING_ELO
+        return float(hist.iloc[idx]["elo"])
+
+    def _last_known_surface_elo(self, player: str, surface: str, date: pd.Timestamp) -> float:
+        hist = self.surface_elo_index.get(player)
+        if hist is None or hist.empty:
+            return STARTING_ELO
+        surf_hist = hist[hist["surface"] == surface]
+        if surf_hist.empty:
+            return STARTING_ELO
+        dates = surf_hist["date"].values
+        idx = np.searchsorted(dates, np.datetime64(date), side="left") - 1
+        if idx < 0:
+            return STARTING_ELO
+        return float(surf_hist.iloc[idx]["elo"])
+
+    # ---------- Trailing serve/return stats (for inference) ----------
+
+    def _build_serve_stat_index(self, df: pd.DataFrame):
+        """
+        Per-player chronological history of three serve/return rates
+        (ace rate, first-serve-points-won rate, break-point-saved rate),
+        one row per match where that rate was computable. Also returns the
+        dataset-wide mean of each rate as a fallback for players with no
+        (or insufficient) history.
+        """
+        fallback_ace = _global_mean_rate(df, "ace", "svpt")
+        fallback_fsw = _global_mean_rate(df, "1stWon", "1stIn")
+        fallback_bps = _global_mean_rate(df, "bpSaved", "bpFaced")
+
+        ace_records: Dict[str, List[tuple]] = {}
+        fsw_records: Dict[str, List[tuple]] = {}
+        bps_records: Dict[str, List[tuple]] = {}
+
+        for _, r in df.iterrows():
+            d = r["tourney_date"]
+            for side, prefix in (("winner_name", "w_"), ("loser_name", "l_")):
+                player = r[side]
+                ace_rate = _safe_rate(r.get(f"{prefix}ace"), r.get(f"{prefix}svpt"))
+                if ace_rate is not None:
+                    ace_records.setdefault(player, []).append((d, ace_rate))
+                fsw_rate = _safe_rate(r.get(f"{prefix}1stWon"), r.get(f"{prefix}1stIn"))
+                if fsw_rate is not None:
+                    fsw_records.setdefault(player, []).append((d, fsw_rate))
+                bps_rate = _safe_rate(r.get(f"{prefix}bpSaved"), r.get(f"{prefix}bpFaced"))
+                if bps_rate is not None:
+                    bps_records.setdefault(player, []).append((d, bps_rate))
+
+        def to_index(records):
+            return {
+                player: pd.DataFrame(lst, columns=["date", "rate"]).sort_values("date").reset_index(drop=True)
+                for player, lst in records.items()
+            }
+
+        return to_index(ace_records), to_index(fsw_records), to_index(bps_records), fallback_ace, fallback_fsw, fallback_bps
+
+    def _trailing_rate(self, index: dict, player: str, date: pd.Timestamp, fallback: float, n: int = N_FORM) -> float:
+        hist = index.get(player)
+        if hist is None or hist.empty:
+            return fallback
+        dates = hist["date"].values
+        idx = np.searchsorted(dates, np.datetime64(date), side="left")
+        if idx <= 0:
+            return fallback
+        window = hist.iloc[max(0, idx - n):idx]
+        return float(window["rate"].mean()) if len(window) else fallback
+
     # Training
     
     def _make_training_examples(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -209,6 +371,15 @@ class TennisPredictor:
 
         overall_hist = defaultdict(lambda: deque(maxlen=N_FORM))  # player -> deque of 1/0
         surface_hist = defaultdict(lambda: defaultdict(lambda: deque(maxlen=N_FORM)))  # player -> surface -> deque
+        elo = defaultdict(lambda: STARTING_ELO)
+        surface_elo = defaultdict(lambda: defaultdict(lambda: STARTING_ELO))
+        ace_hist = defaultdict(lambda: deque(maxlen=N_FORM))
+        fsw_hist = defaultdict(lambda: deque(maxlen=N_FORM))
+        bps_hist = defaultdict(lambda: deque(maxlen=N_FORM))
+
+        fallback_ace = _global_mean_rate(df, "ace", "svpt")
+        fallback_fsw = _global_mean_rate(df, "1stWon", "1stIn")
+        fallback_bps = _global_mean_rate(df, "bpSaved", "bpFaced")
 
         rows = []
 
@@ -231,9 +402,17 @@ class TennisPredictor:
                 wr_s = (sum(s) / len(s)) if len(s) else 0.5
                 return wr_o, wr_s
 
-            # compute form BEFORE updating with this match (prevents leakage)
+            def rate_feat(hist, fallback):
+                return (sum(hist) / len(hist)) if len(hist) else fallback
+
+            # compute form/elo/serve-rates BEFORE updating with this match (prevents leakage)
             w_wr_o, w_wr_s = winrates(w)
             l_wr_o, l_wr_s = winrates(l)
+            w_elo, l_elo = elo[w], elo[l]
+            w_selo, l_selo = surface_elo[surf][w], surface_elo[surf][l]
+            w_ace_r, l_ace_r = rate_feat(ace_hist[w], fallback_ace), rate_feat(ace_hist[l], fallback_ace)
+            w_fsw_r, l_fsw_r = rate_feat(fsw_hist[w], fallback_fsw), rate_feat(fsw_hist[l], fallback_fsw)
+            w_bps_r, l_bps_r = rate_feat(bps_hist[w], fallback_bps), rate_feat(bps_hist[l], fallback_bps)
 
             # Randomize so A isn't always the winner
             swap = rng.random() < 0.5
@@ -241,11 +420,21 @@ class TennisPredictor:
                 A_rank, B_rank = w_rank, l_rank
                 A_wr_o, B_wr_o = w_wr_o, l_wr_o
                 A_wr_s, B_wr_s = w_wr_s, l_wr_s
+                A_elo, B_elo = w_elo, l_elo
+                A_selo, B_selo = w_selo, l_selo
+                A_ace, B_ace = w_ace_r, l_ace_r
+                A_fsw, B_fsw = w_fsw_r, l_fsw_r
+                A_bps, B_bps = w_bps_r, l_bps_r
                 y = 1
             else:
                 A_rank, B_rank = l_rank, w_rank
                 A_wr_o, B_wr_o = l_wr_o, w_wr_o
                 A_wr_s, B_wr_s = l_wr_s, w_wr_s
+                A_elo, B_elo = l_elo, w_elo
+                A_selo, B_selo = l_selo, w_selo
+                A_ace, B_ace = l_ace_r, w_ace_r
+                A_fsw, B_fsw = l_fsw_r, w_fsw_r
+                A_bps, B_bps = l_bps_r, w_bps_r
                 y = 0
 
             best_of = int(r.get("best_of", 3))
@@ -256,17 +445,49 @@ class TennisPredictor:
                 "rank_diff": A_rank - B_rank,
                 "form_diff": A_wr_o - B_wr_o,
                 "surface_form_diff": A_wr_s - B_wr_s,
+                "elo_diff": A_elo - B_elo,
+                "surface_elo_diff": A_selo - B_selo,
+                "ace_rate_diff": A_ace - B_ace,
+                "first_serve_win_rate_diff": A_fsw - B_fsw,
+                "bp_save_rate_diff": A_bps - B_bps,
                 "y": y,
                 "best_of": best_of,
                 "num_sets": _parse_num_sets(r.get("score"), best_of),
             })
 
-            # update histories after creating features
+            # update all trailing state after creating features
             overall_hist[w].append(1); overall_hist[l].append(0)
             surface_hist[w][surf].append(1); surface_hist[l][surf].append(0)
-    
+
+            exp_w = 1.0 / (1.0 + 10 ** ((l_elo - w_elo) / 400.0))
+            elo[w] = w_elo + K_ELO * (1 - exp_w)
+            elo[l] = l_elo - K_ELO * (1 - exp_w)
+            exp_w_s = 1.0 / (1.0 + 10 ** ((l_selo - w_selo) / 400.0))
+            surface_elo[surf][w] = w_selo + K_ELO * (1 - exp_w_s)
+            surface_elo[surf][l] = l_selo - K_ELO * (1 - exp_w_s)
+
+            w_ace_rate = _safe_rate(r.get("w_ace"), r.get("w_svpt"))
+            l_ace_rate = _safe_rate(r.get("l_ace"), r.get("l_svpt"))
+            if w_ace_rate is not None: ace_hist[w].append(w_ace_rate)
+            if l_ace_rate is not None: ace_hist[l].append(l_ace_rate)
+
+            w_fsw_rate = _safe_rate(r.get("w_1stWon"), r.get("w_1stIn"))
+            l_fsw_rate = _safe_rate(r.get("l_1stWon"), r.get("l_1stIn"))
+            if w_fsw_rate is not None: fsw_hist[w].append(w_fsw_rate)
+            if l_fsw_rate is not None: fsw_hist[l].append(l_fsw_rate)
+
+            w_bps_rate = _safe_rate(r.get("w_bpSaved"), r.get("w_bpFaced"))
+            l_bps_rate = _safe_rate(r.get("l_bpSaved"), r.get("l_bpFaced"))
+            if w_bps_rate is not None: bps_hist[w].append(w_bps_rate)
+            if l_bps_rate is not None: bps_hist[l].append(l_bps_rate)
+
         return pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
 
+
+    WIN_NUM_COLS = [
+        "rank_diff", "form_diff", "surface_form_diff",
+        "elo_diff", "surface_elo_diff", "ace_rate_diff", "first_serve_win_rate_diff", "bp_save_rate_diff",
+    ]
 
     def _train_win_model(self, data: pd.DataFrame) -> Pipeline:
         # time split (train on older data)
@@ -274,7 +495,7 @@ class TennisPredictor:
 
         preprocess = ColumnTransformer(
             transformers=[
-                ("num", "passthrough", ["rank_diff", "form_diff", "surface_form_diff"]),
+                ("num", "passthrough", self.WIN_NUM_COLS),
                 ("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=False), ["surface", "tourney_level"]),
             ]
         )
@@ -291,27 +512,33 @@ class TennisPredictor:
             ]
         )
 
-        X_train = train[["rank_diff", "form_diff", "surface_form_diff", "surface", "tourney_level"]]
+        X_train = train[self.WIN_NUM_COLS + ["surface", "tourney_level"]]
         y_train = train["y"]
         clf.fit(X_train, y_train)
         return clf
 
+    SETS_NUM_COLS = [
+        "abs_rank_diff", "abs_form_diff", "abs_surface_form_diff",
+        "abs_elo_diff", "abs_surface_elo_diff", "abs_ace_rate_diff",
+        "abs_first_serve_win_rate_diff", "abs_bp_save_rate_diff", "best_of",
+    ]
+
     def _train_sets_model(self, data: pd.DataFrame) -> Pipeline:
         """
         Predicts how many sets a match goes, independent of who wins: match
-        length is driven by how close the matchup is (rank/form gap), not by
-        player identity, so features are unsigned (abs) versions of the win
-        model's diff features plus best_of. Rows with unknown set count
+        length is driven by how close the matchup is (rank/form/elo/serve gap),
+        not by player identity, so features are unsigned (abs) versions of the
+        win model's diff features plus best_of. Rows with unknown set count
         (retirements/walkovers/missing scores) are excluded.
         """
         train = data[(data["date"] < "2023-01-01") & data["num_sets"].notna()].copy()
-        train["abs_rank_diff"] = train["rank_diff"].abs()
-        train["abs_form_diff"] = train["form_diff"].abs()
-        train["abs_surface_form_diff"] = train["surface_form_diff"].abs()
+        for col in ["rank_diff", "form_diff", "surface_form_diff", "elo_diff",
+                    "surface_elo_diff", "ace_rate_diff", "first_serve_win_rate_diff", "bp_save_rate_diff"]:
+            train[f"abs_{col}"] = train[col].abs()
 
         preprocess = ColumnTransformer(
             transformers=[
-                ("num", "passthrough", ["abs_rank_diff", "abs_form_diff", "abs_surface_form_diff", "best_of"]),
+                ("num", "passthrough", self.SETS_NUM_COLS),
                 ("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=False), ["surface", "tourney_level"]),
             ]
         )
@@ -328,7 +555,7 @@ class TennisPredictor:
             ]
         )
 
-        X_train = train[["abs_rank_diff", "abs_form_diff", "abs_surface_form_diff", "best_of", "surface", "tourney_level"]]
+        X_train = train[self.SETS_NUM_COLS + ["surface", "tourney_level"]]
         y_train = train["num_sets"].astype(int)
         clf.fit(X_train, y_train)
         return clf
@@ -465,11 +692,33 @@ class TennisPredictor:
         form_diff = formA - formB
         surface_form_diff = surfFormA - surfFormB
 
+        eloA = self._last_known_elo(playerA, d)
+        eloB = self._last_known_elo(playerB, d)
+        surfEloA = self._last_known_surface_elo(playerA, surface, d)
+        surfEloB = self._last_known_surface_elo(playerB, surface, d)
+        elo_diff = eloA - eloB
+        surface_elo_diff = surfEloA - surfEloB
+
+        aceA = self._trailing_rate(self.ace_index, playerA, d, self._fallback_ace)
+        aceB = self._trailing_rate(self.ace_index, playerB, d, self._fallback_ace)
+        fswA = self._trailing_rate(self.fsw_index, playerA, d, self._fallback_fsw)
+        fswB = self._trailing_rate(self.fsw_index, playerB, d, self._fallback_fsw)
+        bpsA = self._trailing_rate(self.bps_index, playerA, d, self._fallback_bps)
+        bpsB = self._trailing_rate(self.bps_index, playerB, d, self._fallback_bps)
+        ace_rate_diff = aceA - aceB
+        first_serve_win_rate_diff = fswA - fswB
+        bp_save_rate_diff = bpsA - bpsB
+
         X = pd.DataFrame(
             [{
                 "rank_diff": rank_diff,
                 "form_diff": form_diff,
                 "surface_form_diff": surface_form_diff,
+                "elo_diff": elo_diff,
+                "surface_elo_diff": surface_elo_diff,
+                "ace_rate_diff": ace_rate_diff,
+                "first_serve_win_rate_diff": first_serve_win_rate_diff,
+                "bp_save_rate_diff": bp_save_rate_diff,
                 "surface": surface,
                 "tourney_level": tourney_level,
             }]
@@ -482,6 +731,11 @@ class TennisPredictor:
                 "abs_rank_diff": abs(rank_diff),
                 "abs_form_diff": abs(form_diff),
                 "abs_surface_form_diff": abs(surface_form_diff),
+                "abs_elo_diff": abs(elo_diff),
+                "abs_surface_elo_diff": abs(surface_elo_diff),
+                "abs_ace_rate_diff": abs(ace_rate_diff),
+                "abs_first_serve_win_rate_diff": abs(first_serve_win_rate_diff),
+                "abs_bp_save_rate_diff": abs(bp_save_rate_diff),
                 "best_of": best_of,
                 "surface": surface,
                 "tourney_level": tourney_level,

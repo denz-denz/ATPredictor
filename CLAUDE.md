@@ -23,8 +23,12 @@ models/
 src/
   predictor.py                 TennisPredictor class — the real, current model code
   build_model.py                Trains from data/ and writes models/predictor.joblib
-  train_baseline.py            Standalone training/eval script (train/valid/test split + metrics)
+  train_baseline.py            Standalone training/eval script (train/valid/test split + metrics;
+                                 simpler feature set than predictor.py, pre-dates several additions)
   run_predictor.py              Manual smoke-test entrypoint (hardcoded example match)
+  experiment_features.py        One-off script comparing the current production feature set against
+                                 candidate additions (used to validate Elo/serve-stat features below
+                                 before adopting them — keep as a template for future feature trials)
 app.py                       Streamlit UI (dropdowns for Player A/B + tournament, Predict button)
 requirements.txt             pandas, numpy, scikit-learn, streamlit, joblib
 .venv/                       Local virtualenv (not tracked)
@@ -37,7 +41,11 @@ requirements.txt             pandas, numpy, scikit-learn, streamlit, joblib
 1. Loads every `data/atp_matches_20*.csv`, concatenates, parses `tourney_date`,
    sorts chronologically.
 2. Builds a **rank index** per player (date → rank), a **form index** per
-   player (date, win/loss, surface), a **tournament index**
+   player (date, win/loss, surface), an **Elo index** (overall + per-surface,
+   `_build_elo_index`: standard sequential Elo replay, `K=32`, everyone starts
+   at 1500), a **serve/return stat index** (trailing ace rate, first-serve-won
+   rate, break-point-saved rate, each with a dataset-wide fallback mean for
+   players with no/thin history), a **tournament index**
    (`tourney_name -> {surface, tourney_level, best_of}`, from each
    tournament's most recent observed row), and a trimmed **activity table**
    (date, winner, loser only — backs `list_recent_players`, deliberately
@@ -46,17 +54,24 @@ requirements.txt             pandas, numpy, scikit-learn, streamlit, joblib
 3. Trains **two** `HistGradientBoostingClassifier` pipelines from one shared
    set of training examples (`_make_training_examples`, built by randomly
    swapping each historical winner/loser into "A"/"B" so the model doesn't
-   learn "A always wins", with rank/form computed strictly from matches
-   *before* the match date — no leakage):
-   - **Win model** (`self.model`): features `rank_diff`, `form_diff`,
-     `surface_form_diff` (all A − B), one-hot `surface`/`tourney_level`.
-   - **Set-count model** (`self.sets_model`): a separate, symmetric model —
-     does *not* condition on who wins, since match length is driven by how
-     close the matchup is, not identity. Features are the *unsigned*
-     (`abs()`) versions of the same diffs, plus `best_of`. Target is number
-     of sets played, parsed from the `score` column via `_parse_num_sets`
-     (excludes retirements/walkovers/`RET`/`W/O`/etc., since true length is
-     unknowable for those).
+   learn "A always wins", with every feature below computed strictly from
+   matches *before* the match date — no leakage):
+   - **Win model** (`self.model`, `TennisPredictor.WIN_NUM_COLS`): features
+     `rank_diff`, `form_diff`, `surface_form_diff`, `elo_diff`,
+     `surface_elo_diff`, `ace_rate_diff`, `first_serve_win_rate_diff`,
+     `bp_save_rate_diff` (all A − B), one-hot `surface`/`tourney_level`. The
+     Elo/serve-stat features were validated via `experiment_features.py`
+     before being adopted — held-out test AUC went 0.675 → 0.707 and log loss
+     0.647 → 0.630 versus rank/form alone.
+   - **Set-count model** (`self.sets_model`, `TennisPredictor.SETS_NUM_COLS`):
+     a separate, symmetric model — does *not* condition on who wins, since
+     match length is driven by how close the matchup is, not identity.
+     Features are the *unsigned* (`abs()`) versions of the same diffs, plus
+     `best_of`. Target is number of sets played, parsed from the `score`
+     column via `_parse_num_sets` (excludes retirements/walkovers/`RET`/`W/O`/
+     etc., since true length is unknowable for those). The same added
+     features gave a smaller but still positive gain here (test log loss
+     0.740 → 0.736).
 
 Both models train on `date < 2023-01-01`; `train_baseline.py` also reports
 `valid` (2023) / `test` (>= 2024) metrics.
@@ -84,8 +99,8 @@ Training is not free (a few seconds for ~20k rows × 2 models) and, more
 importantly, **the deployed app should never need the raw dataset** (see
 README.md for why). So:
 - `predictor.save(model_dir="models")` serializes the two fitted pipelines +
-  the rank/form/tournament/activity lookup tables (not raw match rows) to
-  `models/predictor.joblib` via `joblib`.
+  the rank/form/elo/serve-stat/tournament/activity lookup tables (not raw
+  match rows) to `models/predictor.joblib` via `joblib`.
 - `TennisPredictor.load(model_dir="models")` is a classmethod that
   reconstructs a working predictor from that artifact alone — bypasses
   `__init__`/`_load_matches` entirely, no `data/` access.
