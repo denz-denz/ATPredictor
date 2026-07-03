@@ -59,16 +59,26 @@ if st.button("Predict", type="primary"):
         except ValueError as e:
             st.error(str(e))
         else:
-            st.subheader(result.summary)
-
             winner = player_a if result.prob_A_wins >= 0.5 else player_b
-            st.metric(f"P({winner} wins)", f"{max(result.prob_A_wins, 1 - result.prob_A_wins):.0%}")
+            p_win = max(result.prob_A_wins, 1 - result.prob_A_wins)
+            p_sets = result.sets_probs[result.predicted_sets]
+            joint = p_win * p_sets
+
+            st.subheader(f"{winner} to win in {result.predicted_sets} sets")
+            st.caption(
+                f"P({winner} wins) {p_win:.0%} × P(match goes {result.predicted_sets} sets) {p_sets:.0%} "
+                f"= {joint:.0%} combined probability of this exact outcome"
+            )
+
+            st.metric(f"P({winner} wins)", f"{p_win:.0%}")
 
             st.write("Win probability")
             st.progress(result.prob_A_wins, text=f"{player_a} {result.prob_A_wins:.0%} — {1 - result.prob_A_wins:.0%} {player_b}")
 
             st.write("Set count probabilities")
+            st.caption("How many sets the match takes, independent of who wins.")
             sets_df = pd.DataFrame(
-                {"sets": list(result.sets_probs.keys()), "probability": list(result.sets_probs.values())}
+                {"sets": [str(s) for s in result.sets_probs.keys()], "probability": list(result.sets_probs.values())}
             ).set_index("sets")
             st.bar_chart(sets_df)
+            st.caption(" · ".join(f"{s} sets: {p:.0%}" for s, p in result.sets_probs.items()))
