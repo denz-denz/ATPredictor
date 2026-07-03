@@ -22,13 +22,24 @@ predictor = load_predictor()
 players = predictor.list_recent_players(months=18)
 tournaments = predictor.list_tournaments()
 
+
+def filtered_options(all_options, query):
+    if not query:
+        return all_options
+    q = query.lower()
+    return [o for o in all_options if q in o.lower()]
+
+
 col1, col2 = st.columns(2)
 with col1:
-    player_a = st.selectbox("Player A", players, index=None, placeholder="Choose a player")
+    query_a = st.text_input("Search Player A", placeholder="Type to search…")
+    player_a = st.selectbox("Player A", filtered_options(players, query_a), index=None, placeholder="Choose a player")
 with col2:
-    player_b = st.selectbox("Player B", players, index=None, placeholder="Choose a player")
+    query_b = st.text_input("Search Player B", placeholder="Type to search…")
+    player_b = st.selectbox("Player B", filtered_options(players, query_b), index=None, placeholder="Choose a player")
 
-tournament = st.selectbox("Tournament", tournaments, index=None, placeholder="Choose a tournament")
+query_t = st.text_input("Search Tournament", placeholder="Type to search…")
+tournament = st.selectbox("Tournament", filtered_options(tournaments, query_t), index=None, placeholder="Choose a tournament")
 
 if st.button("Predict", type="primary"):
     if not player_a or not player_b:
